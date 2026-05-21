@@ -34,6 +34,7 @@ import { StackPreloadFlow } from './Screens/StackPreloadFlow';
 import { StackPreventRemove } from './Screens/StackPreventRemove';
 import { StackRetain } from './Screens/StackRetain';
 import { StackTransparentModal } from './Screens/StackTransparentModal';
+import { StandardNavigation } from './Screens/StandardNavigation';
 import { StaticConfig as StaticConfigScreen } from './Screens/StaticConfig';
 import { BottomTabsShowcase } from './Showcase/BottomTabsShowcase';
 import { DrawerShowcase } from './Showcase/DrawerShowcase';
@@ -66,6 +67,7 @@ export const SCREENS = {
   MaterialTopTabsBasic,
   LibrariesDrawerLayout,
   LibrariesTabView,
+  StandardNavigation,
   ComponentsButton,
   ComponentsHeaders,
   ComponentsLink,
