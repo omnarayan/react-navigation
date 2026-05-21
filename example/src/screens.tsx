@@ -27,6 +27,7 @@ import { StackHeaderCustomization } from './Screens/StackHeaderCustomization';
 import { StackPreloadFlow } from './Screens/StackPreloadFlow';
 import { StackPreventRemove } from './Screens/StackPreventRemove';
 import { StackTransparent } from './Screens/StackTransparent';
+import { StandardNavigation } from './Screens/StandardNavigation';
 import { StaticScreen } from './Screens/Static';
 import { TabPreloadFlow } from './Screens/TabPreloadFlow';
 import { TabView } from './Screens/TabView';
@@ -47,6 +48,7 @@ export const SCREENS = {
   DynamicTabs,
   FullHistoryTabs,
   MasterDetail,
+  StandardNavigation,
   AuthFlow,
   ScreenLayout,
   NavigatorLayout,
