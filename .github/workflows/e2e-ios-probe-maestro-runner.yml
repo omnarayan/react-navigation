@@ -90,6 +90,14 @@ jobs:
           cp -R /tmp/maestro-runner-dl/maestro-runner/. "$HOME/.maestro-runner/"
           echo "$HOME/.maestro-runner/bin" >> $GITHUB_PATH
 
+      - name: Stage bundled drivers next to working dir
+        # maestro-runner 1.1.15 resolves drivers/ios/WebDriverAgent relative to
+        # CWD, not relative to the binary. Without this symlink the WDA driver
+        # treats the bundled WDA as missing and tries to fetch from GitHub at
+        # runtime — which 403s on CI runners (unauthenticated rate limit on a
+        # shared IP).
+        run: ln -sf "$HOME/.maestro-runner/drivers" "$GITHUB_WORKSPACE/example/drivers"
+
       - name: Boot iOS Simulator + pre-approve scheme
         timeout-minutes: 5
         run: |
