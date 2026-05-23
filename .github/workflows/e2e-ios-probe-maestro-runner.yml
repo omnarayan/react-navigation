@@ -15,7 +15,7 @@ on:
       release_tag:
         description: "Release tag holding ReactNavigationExample.app.tar.gz"
         type: string
-        default: "probe-app-v1"
+        default: "probe-app-v2"
       driver:
         description: "maestro-runner driver to use"
         type: choice
