@@ -22,9 +22,13 @@ on:
         options: [wda, devicelab]
         default: wda
       maestro_runner_version:
-        description: "maestro-runner version (downloaded from open.devicelab.dev)"
+        description: "maestro-runner version (downloaded from open.devicelab.dev unless maestro_runner_url is set)"
         type: string
         default: "1.1.15"
+      maestro_runner_url:
+        description: "Override download URL for the darwin-arm64 tarball (e.g. a fork release for testing pre-release builds). When set, ignores maestro_runner_version."
+        type: string
+        default: ""
 
 jobs:
   maestro-runner-ios:
@@ -80,8 +84,21 @@ jobs:
           tar -xzf /tmp/app.tar.gz -C ios-debug-build
 
       - name: Install maestro-runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAESTRO_RUNNER_URL: ${{ inputs.maestro_runner_url }}
         run: |
-          maestro_runner_url="https://open.devicelab.dev/download/maestro-runner/${MAESTRO_RUNNER_VERSION}/maestro-runner-${MAESTRO_RUNNER_VERSION}-darwin-arm64.tar.gz"
+          if [ -n "$MAESTRO_RUNNER_URL" ]; then
+            echo "Override URL set; downloading from: $MAESTRO_RUNNER_URL"
+            # If it's a GitHub release URL, use gh; else curl
+            if [[ "$MAESTRO_RUNNER_URL" == https://github.com/*/releases/* ]]; then
+              maestro_runner_url="$MAESTRO_RUNNER_URL"
+            else
+              maestro_runner_url="$MAESTRO_RUNNER_URL"
+            fi
+          else
+            maestro_runner_url="https://open.devicelab.dev/download/maestro-runner/${MAESTRO_RUNNER_VERSION}/maestro-runner-${MAESTRO_RUNNER_VERSION}-darwin-arm64.tar.gz"
+          fi
           mkdir -p /tmp/maestro-runner-dl
           curl -fsSL "$maestro_runner_url" -o /tmp/maestro-runner-dl/mr.tar.gz
           tar -xzf /tmp/maestro-runner-dl/mr.tar.gz -C /tmp/maestro-runner-dl
