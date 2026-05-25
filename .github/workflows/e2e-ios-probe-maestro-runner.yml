@@ -181,6 +181,8 @@ jobs:
             /tmp/mr-report/**/*
             ~/mr-simulator.log
             ~/Library/Logs/maestro/xctest_runner_logs/*
+            ~/.maestro-runner/cache/devicelab-ios-runner-builds/*/logs/*
+            ~/.maestro-runner/cache/wda-builds/*/logs/*
           include-hidden-files: true
           if-no-files-found: warn
           overwrite: true
