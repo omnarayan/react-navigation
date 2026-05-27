@@ -187,6 +187,11 @@ jobs:
       - name: Publish primary release
         env:
           GH_TOKEN: ${{ github.token }}
+          # Pin to this workflow's repo. Without --repo, gh defaults to
+          # the checked-out repo's origin — which is upstream
+          # react-navigation/react-navigation here, where our token has
+          # no write access (HTTP 403).
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.tags.outputs.primary_tag }}
           UPSTREAM_SHA: ${{ steps.tags.outputs.upstream_sha }}
         run: |
@@ -213,6 +218,9 @@ jobs:
         if: ${{ success() && (github.event_name == 'schedule' || inputs.update_latest == true) }}
         env:
           GH_TOKEN: ${{ github.token }}
+          # Same as the publish step: pin to this workflow's repo, not
+          # the checked-out upstream where our token can't write.
+          GH_REPO: ${{ github.repository }}
           UPSTREAM_SHA: ${{ steps.tags.outputs.upstream_sha }}
           PRIMARY_TAG: ${{ steps.tags.outputs.primary_tag }}
         run: |
