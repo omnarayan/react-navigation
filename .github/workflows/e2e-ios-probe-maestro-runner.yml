@@ -159,11 +159,15 @@ jobs:
       - name: Run maestro-runner flows
         working-directory: example
         run: |
-          set -x
+          set -uo pipefail
+          # Build the initial flow arg list (relative paths under example/).
           FLOWS=""
           for f in ${{ inputs.flows }}; do
             FLOWS="$FLOWS e2e/maestro/$f"
           done
+
+          # Initial pass — run the full suite.
+          set -x
           maestro-runner \
             --driver "${{ inputs.driver }}" \
             --platform ios \
@@ -171,6 +175,53 @@ jobs:
             -e APP_ID=org.reactnavigation.playground \
             -e APP_SCHEME=rne:// \
             $FLOWS
+          EXIT=$?
+          set +x
+
+          # Retry only the failed flows up to 3 times. Mirrors upstream
+          # maestro's scripts/maestro.ts pattern: parse the report, identify
+          # failures, re-run just those, repeat. Each retry has its own
+          # output dir so the previous report stays intact for diagnostics.
+          REPORT=/tmp/mr-report/report.json
+          for attempt in 1 2 3; do
+            if [ "$EXIT" -eq 0 ]; then break; fi
+            if [ ! -f "$REPORT" ]; then
+              echo "::warning::No report.json after attempt $attempt (likely a setup-level failure); skipping flow retry."
+              break
+            fi
+            FAILED_FLOWS=$(jq -r '.flows[] | select(.status == "failed") | .sourceFile' "$REPORT" 2>/dev/null | xargs -n1 basename | tr '\n' ' ')
+            if [ -z "$FAILED_FLOWS" ]; then
+              # Exit was nonzero but no flows are marked failed in the
+              # report — probably a setup-level failure. Don't retry.
+              echo "::warning::Exit $EXIT but no flow-level failures found; skipping flow retry."
+              break
+            fi
+            echo "::group::Retry #$attempt — re-running failed flows: $FAILED_FLOWS"
+            RETRY_FLOWS=""
+            for f in $FAILED_FLOWS; do RETRY_FLOWS="$RETRY_FLOWS e2e/maestro/$f"; done
+
+            set -x
+            maestro-runner \
+              --driver "${{ inputs.driver }}" \
+              --platform ios \
+              test --output "/tmp/mr-report-retry-$attempt" --flatten \
+              -e APP_ID=org.reactnavigation.playground \
+              -e APP_SCHEME=rne:// \
+              $RETRY_FLOWS
+            RETRY_EXIT=$?
+            set +x
+            echo "::endgroup::"
+
+            if [ "$RETRY_EXIT" -eq 0 ]; then
+              echo "::notice::Retry #$attempt cleared all failed flows."
+              EXIT=0
+              break
+            fi
+            # Continue: target the new retry report's failures next iteration.
+            REPORT="/tmp/mr-report-retry-$attempt/report.json"
+          done
+
+          exit $EXIT
 
       - name: Upload reports + logs on failure
         if: failure() || cancelled() || always()
@@ -179,6 +230,7 @@ jobs:
           name: maestro-runner-output-${{ inputs.driver }}
           path: |
             /tmp/mr-report/**/*
+            /tmp/mr-report-retry-*/**/*
             ~/mr-simulator.log
             ~/Library/Logs/maestro/xctest_runner_logs/*
             ~/.maestro-runner/cache/devicelab-ios-runner-builds/*/logs/*
