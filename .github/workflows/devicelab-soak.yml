@@ -1,0 +1,238 @@
+name: Devicelab soak (every 30 min)
+
+# Scheduled soak for the maestro-runner devicelab driver against the
+# React Navigation E2E suite. Runs every 30 minutes and tracks stability
+# / pass rate over time as a regression signal. Auto-disables after the
+# soak window expires so it doesn't run forever.
+#
+# Each tick:
+#   - Calls the same probe E2E job the manual workflow does
+#   - Driver hardcoded to devicelab
+#   - Uses probe-app-latest (daily rebuilt; falls back to probe-app-v2
+#     if latest doesn't exist yet)
+#   - Same retry layers as the main workflow (startup retry in driver,
+#     flow retry in workflow)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"  # every 30 minutes
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Override release_tag (default probe-app-latest)"
+        type: string
+        default: ""
+
+env:
+  # Soak end date — after this date, the gate step skips the run. Tighten
+  # or extend by editing this string. Format: YYYY-MM-DD (UTC).
+  # 1 week from initial deploy (2026-05-27 → 2026-06-03).
+  SOAK_END_UTC: "2026-06-03"
+
+jobs:
+  gate:
+    # Cheap step: decide whether to actually fire the soak job. Skips
+    # silently after the window closes so cron keeps firing without
+    # billing CI minutes on macOS runners.
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - id: check
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          if [ "$TODAY" \> "$SOAK_END_UTC" ]; then
+            echo "Today ($TODAY) is past soak window end ($SOAK_END_UTC) — skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Today ($TODAY) within soak window (≤$SOAK_END_UTC) — running."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  soak:
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      MAESTRO_RUNNER_VERSION: 1.1.16-rc.9
+      JAVA_DISTRIBUTION: zulu
+      JAVA_VERSION: '17'
+      SIMULATOR_NAME: iPhone 17 Pro
+      # Reuse the same rc.9 tarball as the main workflow's manual
+      # dispatch. When you cut a newer rc, bump this URL.
+      MAESTRO_RUNNER_URL: https://github.com/omnarayan/react-navigation/releases/download/mr-test-1.1.16-rc.9/maestro-runner-1.1.16-rc.9-darwin-arm64.tar.gz
+      RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || 'probe-app-latest' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Xcode 26.3
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.3'
+
+      - name: Setup JDK (Zulu 17)
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Install Node + Yarn
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache JS dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            **/node_modules
+            ~/.cache/yarn
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock', 'example/yarn.lock') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-
+
+      - name: Install JS dependencies
+        run: yarn install --immutable
+
+      - name: Resolve release_tag with fallback
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="$RELEASE_TAG"
+          # If the requested tag doesn't exist, fall back to probe-app-v2
+          # so the soak keeps producing data instead of hard-failing on
+          # the download step.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::warning::Release $TAG missing — falling back to probe-app-v2"
+            TAG="probe-app-v2"
+          fi
+          echo "resolved=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using release: $TAG"
+
+      - name: Download pre-built debug .app
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ios-debug-build
+          gh release download "${{ steps.tag.outputs.resolved }}" \
+            --pattern "ReactNavigationExample.app.tar.gz" \
+            --output /tmp/app.tar.gz
+          tar -xzf /tmp/app.tar.gz -C ios-debug-build
+
+      - name: Install maestro-runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/maestro-runner-dl
+          curl -fsSL "$MAESTRO_RUNNER_URL" -o /tmp/maestro-runner-dl/mr.tar.gz
+          tar -xzf /tmp/maestro-runner-dl/mr.tar.gz -C /tmp/maestro-runner-dl
+          mkdir -p "$HOME/.maestro-runner"
+          cp -R /tmp/maestro-runner-dl/maestro-runner/. "$HOME/.maestro-runner/"
+          echo "$HOME/.maestro-runner/bin" >> "$GITHUB_PATH"
+
+      - name: Stage bundled drivers next to working dir
+        run: ln -sf "$HOME/.maestro-runner/drivers" "$GITHUB_WORKSPACE/example/drivers"
+
+      - name: Boot iOS Simulator + pre-approve scheme
+        timeout-minutes: 5
+        run: |
+          DEVICE_ID=$(xcrun simctl list devices available | grep "$SIMULATOR_NAME" | head -n 1 | awk -F "[()]" '{print $2}')
+          xcrun simctl boot "$DEVICE_ID" || true
+          while ! xcrun simctl list devices | grep "$DEVICE_ID" | grep -q "(Booted)"; do
+            sleep 2
+          done
+          PLIST=~/Library/Developer/CoreSimulator/Devices/${DEVICE_ID}/data/Library/Preferences/com.apple.launchservices.schemeapproval.plist
+          mkdir -p "$(dirname "$PLIST")"
+          /usr/libexec/PlistBuddy "$PLIST" -c "add com.apple.CoreSimulator.CoreSimulatorBridge-->rne string org.reactnavigation.playground" 2>/dev/null || \
+          /usr/libexec/PlistBuddy "$PLIST" -c "set com.apple.CoreSimulator.CoreSimulatorBridge-->rne org.reactnavigation.playground"
+          echo "DEVICE_ID=$DEVICE_ID" >> "$GITHUB_ENV"
+
+      - name: Install app on simulator
+        run: xcrun simctl install "$DEVICE_ID" ios-debug-build/ReactNavigationExample.app
+
+      - name: Start Metro bundler
+        run: yarn --cwd example start &
+
+      - name: Wait for Metro bundler
+        timeout-minutes: 5
+        run: |
+          until curl -sSf "http://localhost:8081/.expo/.virtual-metro-entry.bundle?platform=ios&dev=true&minify=false" > /dev/null 2>&1; do
+            sleep 2
+          done
+
+      - name: Capture simulator log in background
+        run: xcrun simctl spawn booted log stream --style syslog > "$HOME/mr-simulator.log" 2>&1 &
+
+      - name: Run maestro-runner flows (devicelab driver, with flow retry)
+        working-directory: example
+        run: |
+          set -uo pipefail
+          FLOWS=""
+          for f in $(ls e2e/maestro/*.yml | xargs -n1 basename | sort); do
+            FLOWS="$FLOWS e2e/maestro/$f"
+          done
+
+          set -x
+          maestro-runner \
+            --driver devicelab \
+            --platform ios \
+            test --output /tmp/mr-report --flatten \
+            -e APP_ID=org.reactnavigation.playground \
+            -e APP_SCHEME=rne:// \
+            $FLOWS
+          EXIT=$?
+          set +x
+
+          REPORT=/tmp/mr-report/report.json
+          for attempt in 1 2 3; do
+            if [ "$EXIT" -eq 0 ]; then break; fi
+            if [ ! -f "$REPORT" ]; then
+              echo "::warning::No report.json after attempt $attempt — skipping flow retry."
+              break
+            fi
+            FAILED_FLOWS=$(jq -r '.flows[] | select(.status == "failed") | .sourceFile' "$REPORT" 2>/dev/null | xargs -n1 basename | tr '\n' ' ')
+            if [ -z "$FAILED_FLOWS" ]; then
+              echo "::warning::Exit $EXIT but no flow-level failures found — skipping flow retry."
+              break
+            fi
+            echo "::group::Retry #$attempt — re-running: $FAILED_FLOWS"
+            RETRY_FLOWS=""
+            for f in $FAILED_FLOWS; do RETRY_FLOWS="$RETRY_FLOWS e2e/maestro/$f"; done
+            set -x
+            maestro-runner \
+              --driver devicelab \
+              --platform ios \
+              test --output "/tmp/mr-report-retry-$attempt" --flatten \
+              -e APP_ID=org.reactnavigation.playground \
+              -e APP_SCHEME=rne:// \
+              $RETRY_FLOWS
+            RETRY_EXIT=$?
+            set +x
+            echo "::endgroup::"
+            if [ "$RETRY_EXIT" -eq 0 ]; then
+              echo "::notice::Retry #$attempt cleared all failed flows."
+              EXIT=0
+              break
+            fi
+            REPORT="/tmp/mr-report-retry-$attempt/report.json"
+          done
+          exit $EXIT
+
+      - name: Upload reports + logs on failure
+        if: failure() || cancelled() || always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devicelab-soak-output-${{ github.run_id }}
+          path: |
+            /tmp/mr-report/**/*
+            /tmp/mr-report-retry-*/**/*
+            ~/mr-simulator.log
+            ~/Library/Logs/maestro/xctest_runner_logs/*
+            ~/.maestro-runner/cache/devicelab-ios-runner-builds/*/logs/*
+          include-hidden-files: true
+          if-no-files-found: warn
+          overwrite: true
