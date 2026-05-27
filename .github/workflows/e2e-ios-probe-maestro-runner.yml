@@ -19,9 +19,9 @@ on:
         type: string
         default: "bottom-tabs.yml stack-basic.yml auth-flow.yml drawer-master-detail.yml"
       release_tag:
-        description: "Release tag holding ReactNavigationExample.app.tar.gz"
+        description: "Release tag holding ReactNavigationExample.app.tar.gz (probe-app-latest = daily build, probe-app-v2 = pinned)"
         type: string
-        default: "probe-app-v2"
+        default: "probe-app-latest"
       driver:
         description: "maestro-runner driver to use"
         type: choice

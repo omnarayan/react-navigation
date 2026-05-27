@@ -1,38 +1,66 @@
 name: Build Probe App (iOS Sim debug)
 
-# Manual trigger. Replicates upstream's e2e-ios.yml build steps verbatim:
-# `yarn expo prebuild --platform ios` + `xcodebuild ... -configuration Debug
-# -destination 'generic/platform=iOS Simulator'`. The resulting .app includes
-# all native deps (react-native-bottom-tabs / RNSTabsHostiOS etc.) that
-# probe-app-v1 was missing. Uploaded to a fork release so both probe
-# workflows can download the same artifact for apples-to-apples runs.
+# Builds the ReactNavigationExample debug .app and publishes it as a
+# release tarball. The probe E2E workflow downloads this tarball
+# instead of building the app per run, saving ~8-12 min each.
+#
+# Triggers:
+#   - daily cron (06:00 UTC): refresh from upstream main, publish a
+#     date-tagged release + update probe-app-latest pointer.
+#   - workflow_dispatch: ad-hoc rebuild. Optional inputs control which
+#     upstream ref to build and which release tag to update.
+#
+# Releases written:
+#   - probe-app-YYYY-MM-DD (immutable per-day record on schedule runs)
+#   - probe-app-latest     (moving pointer the E2E workflow uses)
+#   - (or whatever `target_tag` overrides)
+#
+# Failure handling: the latest pointer is only updated AFTER a
+# successful build, so a broken upstream main leaves yesterday's
+# build in effect for E2E dispatches.
 
 on:
+  schedule:
+    # 06:00 UTC daily (≈ 11:30 IST) — off-peak so the daily build
+    # doesn't compete with interactive E2E dispatches.
+    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
+      upstream_ref:
+        description: "react-navigation ref to build (branch/sha)"
+        type: string
+        default: "main"
       target_tag:
-        description: "Release tag to (re-)create with the built .app"
+        description: "Release tag to publish artifact under (default: probe-app-YYYY-MM-DD on scheduled runs, probe-app-v2 on manual)"
         type: string
         default: "probe-app-v2"
+      update_latest:
+        description: "Re-point probe-app-latest at this build"
+        type: boolean
+        default: true
 
 jobs:
   build:
     runs-on: macos-latest
     timeout-minutes: 60
     permissions:
-      contents: write  # needed for `gh release create / upload`
+      contents: write  # for `gh release create / upload`
     env:
       JAVA_DISTRIBUTION: zulu
-      JAVA_VERSION: '17'
+      JAVA_VERSION: "17"
+      UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
 
     steps:
-      - name: Checkout
+      - name: Checkout react-navigation
         uses: actions/checkout@v4
+        with:
+          repository: react-navigation/react-navigation
+          ref: ${{ env.UPSTREAM_REF }}
 
       - name: Use Xcode 26.3 (match upstream CI)
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '26.3'
+          xcode-version: "26.3"
 
       - name: Setup JDK (Zulu 17)
         uses: actions/setup-java@v5
@@ -43,25 +71,90 @@ jobs:
       - name: Install Node + Yarn
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
+
+      - name: Resolve build fingerprint
+        id: fingerprint
+        run: |
+          cd example
+          # Same mechanism upstream uses for their build cache key.
+          FP=$(npx expo-updates fingerprint:generate --platform ios 2>/dev/null | jq -r '.hash' 2>/dev/null || echo "unknown")
+          echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
+          echo "Fingerprint: $FP"
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            example/ios/Pods
+            ~/.cocoapods
+            ~/Library/Caches/CocoaPods
+          key: probe-pods-${{ runner.os }}-${{ steps.fingerprint.outputs.fingerprint }}
+          restore-keys: |
+            probe-pods-${{ runner.os }}-
+
+      - name: Cache DerivedData
+        uses: actions/cache@v4
+        with:
+          path: example/ios/build
+          key: probe-deriveddata-${{ runner.os }}-${{ steps.fingerprint.outputs.fingerprint }}
+          restore-keys: |
+            probe-deriveddata-${{ runner.os }}-
 
       - name: Install JS dependencies
         run: yarn install --immutable
 
-      - name: Build iOS App (upstream-equivalent)
+      - name: Build iOS app (with retry)
         working-directory: example
         run: |
-          set -euxo pipefail
-          yarn expo prebuild --platform ios
-          xcodebuild ONLY_ACTIVE_ARCH=YES \
-            -workspace ios/ReactNavigationExample.xcworkspace \
-            -UseNewBuildSystem=YES \
-            -scheme ReactNavigationExample \
-            -configuration Debug \
-            -destination 'generic/platform=iOS Simulator' \
-            -sdk iphonesimulator \
-            -derivedDataPath ios/build \
-            -quiet
+          set -uo pipefail
+          # Retry the prebuild + pod install + xcodebuild pipeline up to 3
+          # times. CI runners see transient flakes: network blips on
+          # CocoaPods fetch, signing-service hiccups, xcodebuild internal
+          # errors. A quick retry usually clears them. Same retry-on-
+          # transient-failure pattern as maestro-runner startup retry +
+          # workflow flow retry.
+          ATTEMPTS=3
+          for attempt in $(seq 1 $ATTEMPTS); do
+            echo "::group::Build attempt $attempt/$ATTEMPTS"
+            set +e
+            (
+              set -e
+              yarn expo prebuild --platform ios --no-install
+              # --no-install: keep pod install as its own step so a pod
+              # install flake doesn't force a full prebuild re-run.
+              ( cd ios && pod install )
+              xcodebuild ONLY_ACTIVE_ARCH=YES \
+                -workspace ios/ReactNavigationExample.xcworkspace \
+                -UseNewBuildSystem=YES \
+                -scheme ReactNavigationExample \
+                -configuration Debug \
+                -destination 'generic/platform=iOS Simulator' \
+                -sdk iphonesimulator \
+                -derivedDataPath ios/build \
+                -quiet
+            )
+            ATTEMPT_EXIT=$?
+            set -e
+            echo "::endgroup::"
+
+            if [ $ATTEMPT_EXIT -eq 0 ]; then
+              echo "::notice::Build succeeded on attempt $attempt/$ATTEMPTS"
+              break
+            fi
+            if [ $attempt -eq $ATTEMPTS ]; then
+              echo "::error::Build failed after $ATTEMPTS attempts. Last exit: $ATTEMPT_EXIT"
+              exit $ATTEMPT_EXIT
+            fi
+            echo "::warning::Build attempt $attempt failed (exit $ATTEMPT_EXIT). Retrying in 15s..."
+            sleep 15
+          done
+
+          APP_PATH="ios/build/Build/Products/Debug-iphonesimulator/ReactNavigationExample.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::Build reported success but $APP_PATH is missing"
+            exit 1
+          fi
 
       - name: Package .app
         run: |
@@ -70,31 +163,82 @@ jobs:
           cp -R example/ios/build/Build/Products/Debug-iphonesimulator/ReactNavigationExample.app out/
           cd out
           tar -czf ReactNavigationExample.app.tar.gz ReactNavigationExample.app
+          shasum -a 256 ReactNavigationExample.app.tar.gz \
+            | tee ReactNavigationExample.app.tar.gz.sha256
           ls -lh ReactNavigationExample.app.tar.gz
 
-      - name: Upload to release
+      - name: Resolve release tags
+        id: tags
+        run: |
+          UPSTREAM_SHA=$(git rev-parse HEAD)
+          # On schedule runs: publish to a dated release. On manual:
+          # use the caller-supplied target_tag (defaults to probe-app-v2
+          # for back-compat with existing E2E workflow defaults).
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            PRIMARY_TAG="probe-app-$(date -u +%Y-%m-%d)"
+          else
+            PRIMARY_TAG="${{ inputs.target_tag }}"
+          fi
+          echo "primary_tag=$PRIMARY_TAG" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "Primary tag:  $PRIMARY_TAG"
+          echo "Upstream SHA: $UPSTREAM_SHA"
+
+      - name: Publish primary release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.target_tag }}
+          TAG: ${{ steps.tags.outputs.primary_tag }}
+          UPSTREAM_SHA: ${{ steps.tags.outputs.upstream_sha }}
         run: |
           set -euxo pipefail
-          # If the release exists, replace the asset; otherwise create a new one.
+          NOTES="Probe app build. Upstream ref: $UPSTREAM_REF ($UPSTREAM_SHA). Built $(date -u +%FT%TZ)."
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG exists — uploading asset (clobbering if present)"
-            gh release upload "$TAG" out/ReactNavigationExample.app.tar.gz --clobber
+            gh release upload "$TAG" \
+              out/ReactNavigationExample.app.tar.gz \
+              out/ReactNavigationExample.app.tar.gz.sha256 \
+              --clobber
+            gh release edit "$TAG" --notes "$NOTES"
           else
-            echo "Creating release $TAG"
             gh release create "$TAG" \
-              --title "Probe app ($TAG, Debug iOS Sim arm64, full native deps)" \
-              --notes "Built from $(git rev-parse --short HEAD) on $(date -u +%Y-%m-%dT%H:%M:%SZ). Includes RNSTabsHostiOS and all native deps via expo prebuild + pod install." \
-              out/ReactNavigationExample.app.tar.gz
+              --title "Probe app ($TAG, Debug iOS Sim arm64)" \
+              --notes "$NOTES" \
+              out/ReactNavigationExample.app.tar.gz \
+              out/ReactNavigationExample.app.tar.gz.sha256
+          fi
+
+      - name: Update probe-app-latest pointer
+        # Only re-point latest on success AND when caller asked for it
+        # (default on schedule runs and manual dispatches unless opted out).
+        # A failed build leaves the previous probe-app-latest in effect.
+        if: ${{ success() && (github.event_name == 'schedule' || inputs.update_latest == true) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.tags.outputs.upstream_sha }}
+          PRIMARY_TAG: ${{ steps.tags.outputs.primary_tag }}
+        run: |
+          set -euxo pipefail
+          NOTES="Pointer to latest probe app build ($PRIMARY_TAG, upstream $UPSTREAM_SHA, built $(date -u +%FT%TZ))."
+          if gh release view probe-app-latest >/dev/null 2>&1; then
+            gh release upload probe-app-latest \
+              out/ReactNavigationExample.app.tar.gz \
+              out/ReactNavigationExample.app.tar.gz.sha256 \
+              --clobber
+            gh release edit probe-app-latest --notes "$NOTES"
+          else
+            gh release create probe-app-latest \
+              --title "probe-app-latest (moving pointer)" \
+              --notes "$NOTES" \
+              out/ReactNavigationExample.app.tar.gz \
+              out/ReactNavigationExample.app.tar.gz.sha256
           fi
 
       - name: Upload artifact (also available without release)
-        if: always()  # still upload even if release step failed
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ReactNavigationExample-app
-          path: out/ReactNavigationExample.app.tar.gz
+          path: |
+            out/ReactNavigationExample.app.tar.gz
+            out/ReactNavigationExample.app.tar.gz.sha256
           if-no-files-found: error
           overwrite: true
