@@ -2,15 +2,16 @@ name: WDA soak (every 30 min)
 
 # Scheduled soak for the maestro-runner WDA driver against the React
 # Navigation E2E suite. Sibling of devicelab-soak.yml — same shape,
-# same retry pattern, same window — just driver=wda. Lets us track
-# head-to-head pass rate vs the devicelab driver on the same release
-# tag and rc binary.
+# same retry pattern — just driver=wda. Lets us track head-to-head pass
+# rate vs the devicelab driver on the same release tag and binary.
 #
 # Each tick:
 #   - Uses probe-app-latest (daily rebuilt; falls back to probe-app-v2)
-#   - rc.9 maestro-runner binary
+#   - Installs the latest released maestro-runner via the public installer
 #   - 38 flows, 3 workflow-level retries on flow failures
 #   - WDA driver's built-in startup retry (4 attempts, 60s stall detect)
+#
+# Open-ended: runs until the workflow is disabled manually.
 
 on:
   schedule:
@@ -22,40 +23,14 @@ on:
         type: string
         default: ""
 
-env:
-  # Soak end date — after this date, the gate step skips the run. Tighten
-  # or extend by editing this string. Format: YYYY-MM-DD (UTC).
-  # 1 week from initial deploy (2026-05-27 → 2026-06-03).
-  SOAK_END_UTC: "2026-06-03"
-
 jobs:
-  gate:
-    runs-on: ubuntu-latest
-    outputs:
-      should_run: ${{ steps.check.outputs.should_run }}
-    steps:
-      - id: check
-        run: |
-          TODAY=$(date -u +%Y-%m-%d)
-          if [ "$TODAY" \> "$SOAK_END_UTC" ]; then
-            echo "Today ($TODAY) is past soak window end ($SOAK_END_UTC) — skipping."
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Today ($TODAY) within soak window (≤$SOAK_END_UTC) — running."
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-          fi
-
   soak:
-    needs: gate
-    if: needs.gate.outputs.should_run == 'true'
     runs-on: macos-latest
     timeout-minutes: 60
     env:
-      MAESTRO_RUNNER_VERSION: 1.1.16-rc.9
       JAVA_DISTRIBUTION: zulu
       JAVA_VERSION: '17'
       SIMULATOR_NAME: iPhone 17 Pro
-      MAESTRO_RUNNER_URL: https://github.com/omnarayan/react-navigation/releases/download/mr-test-1.1.16-rc.9/maestro-runner-1.1.16-rc.9-darwin-arm64.tar.gz
       RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || 'probe-app-latest' }}
 
     steps:
@@ -120,12 +95,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p /tmp/maestro-runner-dl
-          curl -fsSL "$MAESTRO_RUNNER_URL" -o /tmp/maestro-runner-dl/mr.tar.gz
-          tar -xzf /tmp/maestro-runner-dl/mr.tar.gz -C /tmp/maestro-runner-dl
-          mkdir -p "$HOME/.maestro-runner"
-          cp -R /tmp/maestro-runner-dl/maestro-runner/. "$HOME/.maestro-runner/"
+          # Install the latest released maestro-runner via the public
+          # installer (follows the latest_version pointer — 1.1.16+).
+          curl -fsSL https://open.devicelab.dev/install/maestro-runner | bash
           echo "$HOME/.maestro-runner/bin" >> "$GITHUB_PATH"
+          "$HOME/.maestro-runner/bin/maestro-runner" --version
 
       - name: Stage bundled drivers next to working dir
         run: ln -sf "$HOME/.maestro-runner/drivers" "$GITHUB_WORKSPACE/example/drivers"
