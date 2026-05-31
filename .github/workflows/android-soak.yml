@@ -155,8 +155,11 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -camera-front none
           disable-animations: true
+          # NB: reactivecircus runs this script under /usr/bin/sh (dash),
+          # not bash — so no bashisms (e.g. `set -o pipefail`). $? is
+          # captured directly off maestro-runner, so pipefail isn't needed.
           script: |
-            set -uo pipefail
+            set -u
             # Metro (started on the host above) reaches the emulator via reverse.
             adb reverse tcp:8081 tcp:8081
             adb install -r "$GITHUB_WORKSPACE/android-build/android-debug.apk"
