@@ -1,0 +1,204 @@
+name: Build Probe App (Android debug APK)
+
+# Android counterpart of build-probe-app.yml. Builds the
+# ReactNavigationExample debug APK from upstream main and publishes it as
+# a release asset. The Android soak workflow downloads this instead of
+# building per run.
+#
+# Triggers:
+#   - daily cron (06:00 UTC): refresh from upstream main, publish a
+#     date-tagged release + update android-probe-app-latest pointer.
+#   - workflow_dispatch: ad-hoc rebuild.
+#
+# Releases written:
+#   - android-probe-app-YYYY-MM-DD (immutable per-day record on schedule)
+#   - android-probe-app-latest     (moving pointer the soak uses)
+#
+# Failure handling: the latest pointer is only updated AFTER a successful
+# build, so a broken upstream main leaves yesterday's APK in effect.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "react-navigation ref to build (branch/sha)"
+        type: string
+        default: "main"
+      target_tag:
+        description: "Release tag to publish under (default: android-probe-app-YYYY-MM-DD on schedule, android-probe-app-v1 on manual)"
+        type: string
+        default: "android-probe-app-v1"
+      update_latest:
+        description: "Re-point android-probe-app-latest at this build"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write   # for `gh release create / upload`
+    env:
+      JAVA_DISTRIBUTION: zulu
+      JAVA_VERSION: "17"
+      UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+      # Build x86_64 native libs so the APK runs on the x86_64 emulator
+      # the soak uses (matches upstream e2e-android.yml).
+      ORG_GRADLE_PROJECT_reactNativeArchitectures: x86_64
+
+    steps:
+      - name: Checkout react-navigation (upstream)
+        uses: actions/checkout@v4
+        with:
+          repository: react-navigation/react-navigation
+          ref: ${{ env.UPSTREAM_REF }}
+
+      - name: Setup JDK (Zulu 17)
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Install Node + Yarn
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: probe-android-gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            probe-android-gradle-${{ runner.os }}-
+
+      - name: Install JS dependencies
+        run: yarn install --immutable
+
+      - name: Build Android debug APK (with retry)
+        working-directory: example
+        run: |
+          set -uo pipefail
+          # Same retry-on-transient-failure pattern as the iOS probe build:
+          # CI runners hit network blips on dependency fetch / gradle daemon
+          # hiccups; a quick retry usually clears them.
+          ATTEMPTS=3
+          for attempt in $(seq 1 $ATTEMPTS); do
+            echo "::group::Build attempt $attempt/$ATTEMPTS"
+            set +e
+            (
+              set -e
+              yarn expo prebuild --platform android
+              cd android
+              ./gradlew assembleDebug -DtestBuildType=debug -Dorg.gradle.jvmargs=-Xmx4g
+            )
+            ATTEMPT_EXIT=$?
+            set -e
+            echo "::endgroup::"
+
+            if [ $ATTEMPT_EXIT -eq 0 ]; then
+              echo "::notice::Build succeeded on attempt $attempt/$ATTEMPTS"
+              break
+            fi
+            if [ $attempt -eq $ATTEMPTS ]; then
+              echo "::error::Build failed after $ATTEMPTS attempts. Last exit: $ATTEMPT_EXIT"
+              exit $ATTEMPT_EXIT
+            fi
+            echo "::warning::Build attempt $attempt failed (exit $ATTEMPT_EXIT). Retrying in 15s..."
+            sleep 15
+          done
+
+          APK_PATH="android/app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK_PATH" ]; then
+            echo "::error::Build reported success but $APK_PATH is missing"
+            exit 1
+          fi
+
+      - name: Package APK
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          cp example/android/app/build/outputs/apk/debug/app-debug.apk out/android-debug.apk
+          cd out
+          shasum -a 256 android-debug.apk | tee android-debug.apk.sha256
+          ls -lh android-debug.apk
+
+      - name: Resolve release tags
+        id: tags
+        run: |
+          UPSTREAM_SHA=$(git rev-parse HEAD)
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            PRIMARY_TAG="android-probe-app-$(date -u +%Y-%m-%d)"
+          else
+            PRIMARY_TAG="${{ inputs.target_tag }}"
+          fi
+          echo "primary_tag=$PRIMARY_TAG" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "Primary tag:  $PRIMARY_TAG"
+          echo "Upstream SHA: $UPSTREAM_SHA"
+
+      - name: Publish primary release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Pin to this workflow's repo (the fork). Without --repo, gh
+          # defaults to the checked-out upstream react-navigation, where
+          # our token has no write access (HTTP 403).
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.tags.outputs.primary_tag }}
+          UPSTREAM_SHA: ${{ steps.tags.outputs.upstream_sha }}
+        run: |
+          set -euxo pipefail
+          NOTES="Android probe APK. Upstream ref: $UPSTREAM_REF ($UPSTREAM_SHA). Built $(date -u +%FT%TZ)."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              out/android-debug.apk \
+              out/android-debug.apk.sha256 \
+              --clobber
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" \
+              --title "Android probe app ($TAG, debug APK)" \
+              --notes "$NOTES" \
+              out/android-debug.apk \
+              out/android-debug.apk.sha256
+          fi
+
+      - name: Update android-probe-app-latest pointer
+        if: ${{ success() && (github.event_name == 'schedule' || inputs.update_latest == true) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM_SHA: ${{ steps.tags.outputs.upstream_sha }}
+          PRIMARY_TAG: ${{ steps.tags.outputs.primary_tag }}
+        run: |
+          set -euxo pipefail
+          NOTES="Pointer to latest Android probe APK ($PRIMARY_TAG, upstream $UPSTREAM_SHA, built $(date -u +%FT%TZ))."
+          if gh release view android-probe-app-latest >/dev/null 2>&1; then
+            gh release upload android-probe-app-latest \
+              out/android-debug.apk \
+              out/android-debug.apk.sha256 \
+              --clobber
+            gh release edit android-probe-app-latest --notes "$NOTES"
+          else
+            gh release create android-probe-app-latest \
+              --title "android-probe-app-latest (moving pointer)" \
+              --notes "$NOTES" \
+              out/android-debug.apk \
+              out/android-debug.apk.sha256
+          fi
+
+      - name: Upload artifact (also available without release)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReactNavigationExample-android-apk
+          path: |
+            out/android-debug.apk
+            out/android-debug.apk.sha256
+          if-no-files-found: error
+          overwrite: true

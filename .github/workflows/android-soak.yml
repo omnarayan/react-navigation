@@ -1,0 +1,224 @@
+name: Android soak (every 30 min)
+
+# Android counterpart of devicelab-soak.yml. Scheduled soak for the
+# maestro-runner DeviceLab Android driver against the React Navigation
+# E2E suite. Runs every 30 minutes and tracks stability / pass rate over
+# time as a regression signal.
+#
+# Each tick:
+#   - Boots the same emulator upstream e2e-android.yml uses
+#     (AVD e2e_emulator, pixel_5, API 34, google_apis x86_64)
+#   - Installs maestro-runner via the public installer (latest release)
+#   - Downloads the latest debug APK (android-probe-app-latest, daily
+#     rebuilt; falls back to android-probe-app-v1)
+#   - Runs all flows on the devicelab driver with a 3x failed-flow retry
+#
+# Open-ended: runs until the workflow is disabled manually.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Override APK release tag (default android-probe-app-latest)"
+        type: string
+        default: ""
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      JAVA_DISTRIBUTION: zulu
+      JAVA_VERSION: "17"
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_USER_HOME: /home/runner/.android
+      API_LEVEL: 34
+      AVD_NAME: e2e_emulator
+      EMULATOR_PROFILE: pixel_5
+      EMULATOR_OPTIONS: "-no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -camera-front none -partition-size 4096 -cores 2 -memory 4096"
+      APP_ID: org.reactnavigation.playground
+      APP_SCHEME: "rne://"
+      RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || 'android-probe-app-latest' }}
+      MAESTRO_RUNNER_HOME: /home/runner/.maestro-runner
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK (Zulu 17)
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Install Node + Yarn
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cache JS dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            **/node_modules
+            ~/.cache/yarn
+          key: yarn-${{ runner.os }}-${{ hashFiles('yarn.lock', 'example/yarn.lock') }}
+          restore-keys: |
+            yarn-${{ runner.os }}-
+
+      - name: Install JS dependencies
+        run: yarn install --immutable
+
+      - name: Resolve release_tag with fallback
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="$RELEASE_TAG"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::warning::Release $TAG missing — falling back to android-probe-app-v1"
+            TAG="android-probe-app-v1"
+          fi
+          echo "resolved=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using release: $TAG"
+
+      - name: Download pre-built debug APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p android-build
+          gh release download "${{ steps.tag.outputs.resolved }}" \
+            --pattern "android-debug.apk" \
+            --output android-build/android-debug.apk
+
+      - name: Install maestro-runner (public installer, latest release)
+        run: |
+          curl -fsSL https://open.devicelab.dev/install/maestro-runner | bash
+          echo "$HOME/.maestro-runner/bin" >> "$GITHUB_PATH"
+          "$HOME/.maestro-runner/bin/maestro-runner" --version
+
+      - name: Install AVD dependencies
+        run: |
+          sudo apt update
+          sudo apt-get install -y libpulse0 libgl1 libxkbfile1
+
+      - name: Setup Android SDK paths
+        run: |
+          {
+            echo "$ANDROID_HOME/emulator"
+            echo "$ANDROID_HOME/platform-tools"
+            echo "$ANDROID_HOME/cmdline-tools/latest/bin"
+          } >> "$GITHUB_PATH"
+
+      - name: Install Android SDK components
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install emulator "platform-tools" "platforms;android-${API_LEVEL}" "system-images;android-${API_LEVEL};google_apis;x86_64"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Create AVD
+        run: |
+          avdmanager create avd -n "$AVD_NAME" -d "$EMULATOR_PROFILE" -k "system-images;android-${API_LEVEL};google_apis;x86_64"
+
+      - name: Start Metro bundler
+        run: yarn --cwd example start &
+
+      - name: Start emulator
+        timeout-minutes: 10
+        run: |
+          "$ANDROID_HOME/emulator/emulator" -avd "$AVD_NAME" ${EMULATOR_OPTIONS} &
+          adb wait-for-device
+          adb shell 'while [[ -z $(getprop sys.boot_completed) ]]; do sleep 1; done'
+          adb reverse tcp:8081 tcp:8081
+
+      - name: Wait for Metro bundler
+        timeout-minutes: 5
+        run: |
+          until curl -sSf "http://localhost:8081/.expo/.virtual-metro-entry.bundle?platform=android&dev=true&minify=false" > /dev/null 2>&1; do
+            sleep 2
+          done
+
+      - name: Install app on emulator
+        run: adb install -r android-build/android-debug.apk
+
+      - name: Capture logcat in background
+        run: adb logcat > "$HOME/mr-logcat.log" 2>&1 &
+
+      - name: Run maestro-runner flows (devicelab driver, with flow retry)
+        working-directory: example
+        run: |
+          set -uo pipefail
+          FLOWS=""
+          for f in $(ls e2e/maestro/*.yml | xargs -n1 basename | sort); do
+            FLOWS="$FLOWS e2e/maestro/$f"
+          done
+
+          set -x
+          maestro-runner \
+            --driver devicelab \
+            --platform android \
+            test --output /tmp/mr-report --flatten \
+            -e APP_ID="$APP_ID" \
+            -e APP_SCHEME="$APP_SCHEME" \
+            $FLOWS
+          EXIT=$?
+          set +x
+
+          REPORT=/tmp/mr-report/report.json
+          for attempt in 1 2 3; do
+            if [ "$EXIT" -eq 0 ]; then break; fi
+            if [ ! -f "$REPORT" ]; then
+              echo "::warning::No report.json after attempt $attempt — skipping flow retry."
+              break
+            fi
+            FAILED_FLOWS=$(jq -r '.flows[] | select(.status == "failed") | .sourceFile' "$REPORT" 2>/dev/null | xargs -n1 basename | tr '\n' ' ')
+            if [ -z "$FAILED_FLOWS" ]; then
+              echo "::warning::Exit $EXIT but no flow-level failures found — skipping flow retry."
+              break
+            fi
+            echo "::group::Retry #$attempt — re-running: $FAILED_FLOWS"
+            RETRY_FLOWS=""
+            for f in $FAILED_FLOWS; do RETRY_FLOWS="$RETRY_FLOWS e2e/maestro/$f"; done
+            set -x
+            maestro-runner \
+              --driver devicelab \
+              --platform android \
+              test --output "/tmp/mr-report-retry-$attempt" --flatten \
+              -e APP_ID="$APP_ID" \
+              -e APP_SCHEME="$APP_SCHEME" \
+              $RETRY_FLOWS
+            RETRY_EXIT=$?
+            set +x
+            echo "::endgroup::"
+            if [ "$RETRY_EXIT" -eq 0 ]; then
+              echo "::notice::Retry #$attempt cleared all failed flows."
+              EXIT=0
+              break
+            fi
+            REPORT="/tmp/mr-report-retry-$attempt/report.json"
+          done
+          exit $EXIT
+
+      - name: Kill emulator
+        if: always()
+        run: adb emu kill || true
+
+      - name: Upload reports + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-soak-output-${{ github.run_id }}
+          path: |
+            /tmp/mr-report/**/*
+            /tmp/mr-report-retry-*/**/*
+            ~/mr-logcat.log
+          include-hidden-files: true
+          if-no-files-found: warn
+          overwrite: true
