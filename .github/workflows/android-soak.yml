@@ -95,9 +95,18 @@ jobs:
             --pattern "android-debug.apk" \
             --output android-build/android-debug.apk
 
-      - name: Install maestro-runner (public installer, latest release)
+      - name: Install maestro-runner (settle-fix test build)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -fsSL https://open.devicelab.dev/install/maestro-runner | bash
+          # Pinned test build with the extendedWaitUntil settle-before-find +
+          # poll-interval fix (vs the public 1.1.16 which lacks it). Swap back
+          # to the public installer once the fix ships in a release.
+          gh release download mr-test-settle --repo "${{ github.repository }}" \
+            --pattern "maestro-runner-settle-linux-amd64.tar.gz" --output /tmp/mr.tar.gz
+          mkdir -p /tmp/mr-dl "$HOME/.maestro-runner"
+          tar -xzf /tmp/mr.tar.gz -C /tmp/mr-dl
+          cp -R /tmp/mr-dl/maestro-runner/. "$HOME/.maestro-runner/"
           echo "$HOME/.maestro-runner/bin" >> "$GITHUB_PATH"
           "$HOME/.maestro-runner/bin/maestro-runner" --version
 
