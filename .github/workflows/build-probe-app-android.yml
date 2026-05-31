@@ -2,24 +2,19 @@ name: Build Probe App (Android debug APK)
 
 # Android counterpart of build-probe-app.yml. Builds the
 # ReactNavigationExample debug APK from upstream main and publishes it as
-# a release asset. The Android soak workflow downloads this instead of
-# building per run.
+# a release asset.
 #
-# Triggers:
-#   - daily cron (06:00 UTC): refresh from upstream main, publish a
-#     date-tagged release + update android-probe-app-latest pointer.
-#   - workflow_dispatch: ad-hoc rebuild.
+# DAILY BUILD IS DISABLED. The android-soak now pins a known-good
+# prebuilt APK (android-probe-app-v1, the pr13027 build) because upstream
+# main's native app is currently broken and fails every flow. This
+# workflow is kept for manual (workflow_dispatch) rebuilds only — e.g. to
+# refresh the pinned APK once upstream main is healthy again.
 #
-# Releases written:
-#   - android-probe-app-YYYY-MM-DD (immutable per-day record on schedule)
-#   - android-probe-app-latest     (moving pointer the soak uses)
-#
-# Failure handling: the latest pointer is only updated AFTER a successful
-# build, so a broken upstream main leaves yesterday's APK in effect.
+# Releases written (manual runs only):
+#   - android-probe-app-YYYY-MM-DD / the target_tag input
+#   - android-probe-app-latest pointer (if update_latest)
 
 on:
-  schedule:
-    - cron: "0 6 * * *"   # 06:00 UTC daily
   workflow_dispatch:
     inputs:
       upstream_ref:

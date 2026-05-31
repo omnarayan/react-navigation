@@ -12,8 +12,10 @@ name: Android soak (every 30 min)
 #
 # Each tick:
 #   - Installs maestro-runner via the public installer (latest release)
-#   - Downloads the latest debug APK (android-probe-app-latest; falls
-#     back to android-probe-app-v1)
+#   - Downloads the pinned known-good debug APK (android-probe-app-v1 —
+#     the pr13027 / SDK 55 build that passes locally). We pin instead of
+#     tracking upstream main, whose native app is currently broken
+#     (gesture-handler 3 migration + dep upgrade) and fails every flow.
 #   - Runs all flows on the devicelab driver with a 3x failed-flow retry
 #
 # Open-ended: runs until the workflow is disabled manually.
@@ -24,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Override APK release tag (default android-probe-app-latest)"
+        description: "Override APK release tag (default android-probe-app-v1, pinned known-good)"
         type: string
         default: ""
 
@@ -40,7 +42,7 @@ jobs:
       EMULATOR_PROFILE: pixel_5
       APP_ID: org.reactnavigation.playground
       APP_SCHEME: "rne://"
-      RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || 'android-probe-app-latest' }}
+      RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || 'android-probe-app-v1' }}
       MAESTRO_RUNNER_HOME: /home/runner/.maestro-runner
 
     steps:
