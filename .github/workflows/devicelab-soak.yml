@@ -7,8 +7,7 @@ name: Devicelab soak (every 30 min)
 # Each tick:
 #   - Driver hardcoded to devicelab
 #   - Installs the latest released maestro-runner via the public installer
-#   - Uses probe-app-latest (daily rebuilt; falls back to probe-app-v2
-#     if latest doesn't exist yet)
+#   - Uses the pinned known-good iOS app (ios-probe-app-v1, pr13027)
 #   - Same retry layers as the main workflow (startup retry in driver,
 #     flow retry in workflow)
 #
@@ -20,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Override release_tag (default probe-app-latest)"
+        description: "Override release_tag (default ios-probe-app-v1 (pinned known-good))"
         type: string
         default: ""
 
@@ -32,7 +31,7 @@ jobs:
       JAVA_DISTRIBUTION: zulu
       JAVA_VERSION: '17'
       SIMULATOR_NAME: iPhone 17 Pro
-      RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || 'probe-app-latest' }}
+      RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || 'ios-probe-app-v1' }}
 
     steps:
       - name: Checkout
@@ -77,8 +76,8 @@ jobs:
           # so the soak keeps producing data instead of hard-failing on
           # the download step.
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::warning::Release $TAG missing — falling back to probe-app-v2"
-            TAG="probe-app-v2"
+            echo "::warning::Release $TAG missing — falling back to ios-probe-app-v1"
+            TAG="ios-probe-app-v1"
           fi
           echo "resolved=$TAG" >> "$GITHUB_OUTPUT"
           echo "Using release: $TAG"

@@ -6,7 +6,7 @@ name: WDA soak (every 30 min)
 # rate vs the devicelab driver on the same release tag and binary.
 #
 # Each tick:
-#   - Uses probe-app-latest (daily rebuilt; falls back to probe-app-v2)
+#   - Uses the pinned known-good iOS app (ios-probe-app-v1, pr13027)
 #   - Installs the latest released maestro-runner via the public installer
 #   - 38 flows, 3 workflow-level retries on flow failures
 #   - WDA driver's built-in startup retry (4 attempts, 60s stall detect)
@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Override release_tag (default probe-app-latest)"
+        description: "Override release_tag (default ios-probe-app-v1 (pinned known-good))"
         type: string
         default: ""
 
@@ -31,7 +31,7 @@ jobs:
       JAVA_DISTRIBUTION: zulu
       JAVA_VERSION: '17'
       SIMULATOR_NAME: iPhone 17 Pro
-      RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || 'probe-app-latest' }}
+      RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || 'ios-probe-app-v1' }}
 
     steps:
       - name: Checkout
@@ -74,8 +74,8 @@ jobs:
         run: |
           TAG="$RELEASE_TAG"
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::warning::Release $TAG missing — falling back to probe-app-v2"
-            TAG="probe-app-v2"
+            echo "::warning::Release $TAG missing — falling back to ios-probe-app-v1"
+            TAG="ios-probe-app-v1"
           fi
           echo "resolved=$TAG" >> "$GITHUB_OUTPUT"
           echo "Using release: $TAG"
