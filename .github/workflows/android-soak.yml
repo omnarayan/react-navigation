@@ -1,16 +1,19 @@
 name: Android soak (every 30 min)
 
-# Android counterpart of devicelab-soak.yml. Scheduled soak for the
-# maestro-runner DeviceLab Android driver against the React Navigation
-# E2E suite. Runs every 30 minutes and tracks stability / pass rate over
-# time as a regression signal.
+# Scheduled soak for the maestro-runner DeviceLab Android driver against
+# the React Navigation E2E suite. Runs every 30 minutes and tracks
+# stability / pass rate over time as a regression signal.
+#
+# Emulator: reactivecircus/android-emulator-runner (HW-accelerated via
+# KVM, AVD snapshot caching, robust boot-wait) on API 30 / pixel_5 with
+# 4 cores + 6 GB. This is deliberately tuned beyond the org repo's manual
+# avdmanager setup (ubuntu-latest, API 34, -cores 2, software GPU), which
+# is ~27% pass on Android — too flaky to be a useful soak signal.
 #
 # Each tick:
-#   - Boots the same emulator upstream e2e-android.yml uses
-#     (AVD e2e_emulator, pixel_5, API 34, google_apis x86_64)
 #   - Installs maestro-runner via the public installer (latest release)
-#   - Downloads the latest debug APK (android-probe-app-latest, daily
-#     rebuilt; falls back to android-probe-app-v1)
+#   - Downloads the latest debug APK (android-probe-app-latest; falls
+#     back to android-probe-app-v1)
 #   - Runs all flows on the devicelab driver with a 3x failed-flow retry
 #
 # Open-ended: runs until the workflow is disabled manually.
@@ -32,12 +35,9 @@ jobs:
     env:
       JAVA_DISTRIBUTION: zulu
       JAVA_VERSION: "17"
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_USER_HOME: /home/runner/.android
-      API_LEVEL: 34
+      API_LEVEL: 30
       AVD_NAME: e2e_emulator
       EMULATOR_PROFILE: pixel_5
-      EMULATOR_OPTIONS: "-no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -camera-front none -partition-size 4096 -cores 2 -memory 4096"
       APP_ID: org.reactnavigation.playground
       APP_SCHEME: "rne://"
       RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || 'android-probe-app-latest' }}
@@ -99,44 +99,39 @@ jobs:
           echo "$HOME/.maestro-runner/bin" >> "$GITHUB_PATH"
           "$HOME/.maestro-runner/bin/maestro-runner" --version
 
-      - name: Install AVD dependencies
-        run: |
-          sudo apt update
-          sudo apt-get install -y libpulse0 libgl1 libxkbfile1
-
-      - name: Setup Android SDK paths
-        run: |
-          {
-            echo "$ANDROID_HOME/emulator"
-            echo "$ANDROID_HOME/platform-tools"
-            echo "$ANDROID_HOME/cmdline-tools/latest/bin"
-          } >> "$GITHUB_PATH"
-
-      - name: Install Android SDK components
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install emulator "platform-tools" "platforms;android-${API_LEVEL}" "system-images;android-${API_LEVEL};google_apis;x86_64"
-
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Create AVD
-        run: |
-          avdmanager create avd -n "$AVD_NAME" -d "$EMULATOR_PROFILE" -k "system-images;android-${API_LEVEL};google_apis;x86_64"
+      - name: AVD cache
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-${{ env.API_LEVEL }}-${{ env.EMULATOR_PROFILE }}-x86_64
+
+      - name: Create AVD + snapshot (cache miss only)
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ env.API_LEVEL }}
+          target: google_apis
+          arch: x86_64
+          profile: ${{ env.EMULATOR_PROFILE }}
+          avd-name: ${{ env.AVD_NAME }}
+          cores: 4
+          ram-size: 6144M
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot-save -camera-back none -camera-front none
+          disable-animations: false
+          script: echo "Generated AVD snapshot for caching."
 
       - name: Start Metro bundler
         run: yarn --cwd example start &
-
-      - name: Start emulator
-        timeout-minutes: 10
-        run: |
-          "$ANDROID_HOME/emulator/emulator" -avd "$AVD_NAME" ${EMULATOR_OPTIONS} &
-          adb wait-for-device
-          adb shell 'while [[ -z $(getprop sys.boot_completed) ]]; do sleep 1; done'
-          adb reverse tcp:8081 tcp:8081
 
       - name: Wait for Metro bundler
         timeout-minutes: 5
@@ -145,70 +140,77 @@ jobs:
             sleep 2
           done
 
-      - name: Install app on emulator
-        run: adb install -r android-build/android-debug.apk
+      - name: Run maestro-runner flows on emulator (devicelab driver, flow retry)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ env.API_LEVEL }}
+          target: google_apis
+          arch: x86_64
+          profile: ${{ env.EMULATOR_PROFILE }}
+          avd-name: ${{ env.AVD_NAME }}
+          cores: 4
+          ram-size: 6144M
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -camera-front none
+          disable-animations: true
+          script: |
+            set -uo pipefail
+            # Metro (started on the host above) reaches the emulator via reverse.
+            adb reverse tcp:8081 tcp:8081
+            adb install -r "$GITHUB_WORKSPACE/android-build/android-debug.apk"
+            adb logcat > "$HOME/mr-logcat.log" 2>&1 &
 
-      - name: Capture logcat in background
-        run: adb logcat > "$HOME/mr-logcat.log" 2>&1 &
+            cd "$GITHUB_WORKSPACE/example"
+            FLOWS=""
+            for f in $(ls e2e/maestro/*.yml | xargs -n1 basename | sort); do
+              FLOWS="$FLOWS e2e/maestro/$f"
+            done
 
-      - name: Run maestro-runner flows (devicelab driver, with flow retry)
-        working-directory: example
-        run: |
-          set -uo pipefail
-          FLOWS=""
-          for f in $(ls e2e/maestro/*.yml | xargs -n1 basename | sort); do
-            FLOWS="$FLOWS e2e/maestro/$f"
-          done
-
-          set -x
-          maestro-runner \
-            --driver devicelab \
-            --platform android \
-            test --output /tmp/mr-report --flatten \
-            -e APP_ID="$APP_ID" \
-            -e APP_SCHEME="$APP_SCHEME" \
-            $FLOWS
-          EXIT=$?
-          set +x
-
-          REPORT=/tmp/mr-report/report.json
-          for attempt in 1 2 3; do
-            if [ "$EXIT" -eq 0 ]; then break; fi
-            if [ ! -f "$REPORT" ]; then
-              echo "::warning::No report.json after attempt $attempt — skipping flow retry."
-              break
-            fi
-            FAILED_FLOWS=$(jq -r '.flows[] | select(.status == "failed") | .sourceFile' "$REPORT" 2>/dev/null | xargs -n1 basename | tr '\n' ' ')
-            if [ -z "$FAILED_FLOWS" ]; then
-              echo "::warning::Exit $EXIT but no flow-level failures found — skipping flow retry."
-              break
-            fi
-            echo "::group::Retry #$attempt — re-running: $FAILED_FLOWS"
-            RETRY_FLOWS=""
-            for f in $FAILED_FLOWS; do RETRY_FLOWS="$RETRY_FLOWS e2e/maestro/$f"; done
             set -x
             maestro-runner \
               --driver devicelab \
               --platform android \
-              test --output "/tmp/mr-report-retry-$attempt" --flatten \
+              test --output /tmp/mr-report --flatten \
               -e APP_ID="$APP_ID" \
               -e APP_SCHEME="$APP_SCHEME" \
-              $RETRY_FLOWS
-            RETRY_EXIT=$?
+              $FLOWS
+            EXIT=$?
             set +x
-            echo "::endgroup::"
-            if [ "$RETRY_EXIT" -eq 0 ]; then
-              echo "::notice::Retry #$attempt cleared all failed flows."
-              EXIT=0
-              break
-            fi
-            REPORT="/tmp/mr-report-retry-$attempt/report.json"
-          done
-          exit $EXIT
 
-      - name: Kill emulator
-        if: always()
-        run: adb emu kill || true
+            REPORT=/tmp/mr-report/report.json
+            for attempt in 1 2 3; do
+              if [ "$EXIT" -eq 0 ]; then break; fi
+              if [ ! -f "$REPORT" ]; then
+                echo "::warning::No report.json after attempt $attempt — skipping flow retry."
+                break
+              fi
+              FAILED_FLOWS=$(jq -r '.flows[] | select(.status == "failed") | .sourceFile' "$REPORT" 2>/dev/null | xargs -n1 basename | tr '\n' ' ')
+              if [ -z "$FAILED_FLOWS" ]; then
+                echo "::warning::Exit $EXIT but no flow-level failures found — skipping flow retry."
+                break
+              fi
+              echo "::group::Retry #$attempt — re-running: $FAILED_FLOWS"
+              RETRY_FLOWS=""
+              for f in $FAILED_FLOWS; do RETRY_FLOWS="$RETRY_FLOWS e2e/maestro/$f"; done
+              set -x
+              maestro-runner \
+                --driver devicelab \
+                --platform android \
+                test --output "/tmp/mr-report-retry-$attempt" --flatten \
+                -e APP_ID="$APP_ID" \
+                -e APP_SCHEME="$APP_SCHEME" \
+                $RETRY_FLOWS
+              RETRY_EXIT=$?
+              set +x
+              echo "::endgroup::"
+              if [ "$RETRY_EXIT" -eq 0 ]; then
+                echo "::notice::Retry #$attempt cleared all failed flows."
+                EXIT=0
+                break
+              fi
+              REPORT="/tmp/mr-report-retry-$attempt/report.json"
+            done
+            exit $EXIT
 
       - name: Upload reports + logs
         if: always()
