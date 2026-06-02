@@ -86,7 +86,7 @@ jobs:
             --pattern "android-debug.apk" \
             --output android-build/android-debug.apk
 
-      - name: Install maestro-runner (settle-fix test build)
+      - name: Install maestro-runner (snapshot-mode test build)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -152,6 +152,10 @@ jobs:
 
       - name: Run maestro-runner flows (devicelab driver, with flow retry)
         working-directory: example
+        env:
+          # Snapshot mode: one full UI.snapshot per poll, host-side matching, input-tap
+          # execution, and post-gesture stabilization (the new design under test).
+          MAESTRO_DEVICELAB_SNAPSHOT: "1"
         run: |
           set -uo pipefail
           FLOWS=""
