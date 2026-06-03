@@ -15,7 +15,7 @@ name: WDA soak (every 30 min)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"  # every 30 minutes
+    - cron: "*/25 * * * *"  # every 25 minutes
   workflow_dispatch:
     inputs:
       release_tag:
