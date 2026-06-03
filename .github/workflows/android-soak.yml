@@ -9,8 +9,6 @@ name: Android soak (every 30 min)
 # Open-ended: runs until the workflow is disabled manually.
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes
   workflow_dispatch:
     inputs:
       release_tag:
