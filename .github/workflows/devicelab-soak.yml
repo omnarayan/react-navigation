@@ -159,8 +159,21 @@ jobs:
           for attempt in 1 2 3; do
             if [ "$EXIT" -eq 0 ]; then break; fi
             if [ ! -f "$REPORT" ]; then
-              echo "::warning::No report.json after attempt $attempt — skipping flow retry."
-              break
+              # Driver setup failed (e.g. xcodebuild stalled building the iOS runner) —
+              # no report = 0 flows ran, so re-run the FULL suite, not just failed flows.
+              echo "::warning::No report (driver setup / xcodebuild stall) attempt $attempt — re-running FULL suite"
+              set -x
+              maestro-runner \
+                --driver devicelab \
+                --platform ios \
+                test --output "/tmp/mr-report-retry-$attempt" --flatten \
+                -e APP_ID=org.reactnavigation.playground \
+                -e APP_SCHEME=rne:// \
+                $FLOWS
+              EXIT=$?
+              set +x
+              REPORT="/tmp/mr-report-retry-$attempt/report.json"
+              continue
             fi
             FAILED_FLOWS=$(jq -r '.flows[] | select(.status == "failed") | .sourceFile' "$REPORT" 2>/dev/null | xargs -n1 basename | tr '\n' ' ')
             if [ -z "$FAILED_FLOWS" ]; then
