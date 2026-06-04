@@ -15,7 +15,7 @@ name: Devicelab soak (every 30 min)
 
 on:
   schedule:
-    - cron: "*/25 * * * *"  # every 25 minutes
+    - cron: "*/30 * * * *"  # every 30 minutes
   workflow_dispatch:
     inputs:
       release_tag:
