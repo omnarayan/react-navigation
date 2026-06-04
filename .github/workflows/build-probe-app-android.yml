@@ -48,7 +48,7 @@ jobs:
       - name: Checkout react-navigation (upstream)
         uses: actions/checkout@v4
         with:
-          repository: react-navigation/react-navigation
+          repository: ${{ github.repository }}
           ref: ${{ env.UPSTREAM_REF }}
 
       - name: Setup JDK (Zulu 17)
